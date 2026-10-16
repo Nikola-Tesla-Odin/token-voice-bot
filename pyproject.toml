@@ -1,0 +1,25 @@
+[project]
+name = "token-voice-bot"
+version = "0.1.0"
+description = "Give your Odin.fun token a voice: a persona that posts original lines and quote cards to X and Telegram."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.70",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "pillow>=10",
+]
+
+[project.scripts]
+persona-agent = "persona_agent.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["persona_agent*"]
+
+[tool.setuptools.package-data]
+persona_agent = ["personas/*.yaml", "personas/assets/*", "fonts/*"]

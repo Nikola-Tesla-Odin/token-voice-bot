@@ -1,0 +1,118 @@
+# Gives your token a voice: posts an original line + quote card in your persona's voice.
+#
+# Setup (the Token Voices studio at https://nikola-tesla-odin.github.io/ walks you through it):
+#   1. bot/persona.yaml   – your token's voice and settings (bot: every_hours, budget_usd, trending)
+#   2. Repository secrets – ANTHROPIC_API_KEY, plus TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID and/or
+#                           BUFFER_API_KEY (+ CLOUDINARY_CLOUD_NAME / _API_KEY / _API_SECRET for cards on X)
+#
+# It wakes every hour and posts only when `every_hours` have passed since the last post.
+# Its memory (post history, monthly spend ledger) lives on the `bot-state` branch.
+# Pause: Actions tab → "Token voice" → ⋯ → Disable workflow.
+
+name: Token voice
+
+on:
+  schedule:
+    - cron: "17 * * * *" # hourly, off the top of the hour when GitHub is busiest
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Post now even if it's not due yet"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # to save the bot's memory on the bot-state branch
+
+concurrency:
+  group: token-voice
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load bot memory
+        run: |
+          if git ls-remote --exit-code --heads origin bot-state >/dev/null; then
+            git fetch -q origin bot-state
+            git worktree add -q .state origin/bot-state
+          else
+            git worktree add -q --orphan -b bot-state .state
+          fi
+
+      - name: Check whether a post is due
+        id: due
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import glob, json, os, re, sys, time
+          from datetime import datetime
+          if not os.path.exists("bot/persona.yaml"):
+              print("::warning::No bot/persona.yaml yet. Create it with the Token Voices studio.", file=sys.stderr)
+              print("run=false"); sys.exit()
+          text = open("bot/persona.yaml").read()
+          m = re.search(r"^\s+every_hours:\s*(\d+)", text, re.M)
+          every = int(m.group(1)) if m else 4
+          last = 0
+          for f in glob.glob(".state/bot/history/*.jsonl"):
+              lines = [l for l in open(f) if l.strip()]
+              if lines:
+                  last = max(last, datetime.fromisoformat(json.loads(lines[-1])["time"]).timestamp())
+          due = time.time() - last >= every * 3600 - 15 * 60  # 15 min slack for GitHub's late starts
+          force = os.environ.get("FORCE") == "true"
+          print(f"run={'true' if due or force else 'false'}")
+          print(f"Every {every}h; last post {(time.time() - last) / 3600:.1f}h ago; due={due}; force={force}", file=sys.stderr)
+          EOF
+
+      - uses: actions/setup-python@v5
+        if: steps.due.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Post
+        if: steps.due.outputs.run == 'true'
+        env:
+          PERSONA_AGENT_HOME: ${{ github.workspace }}/.state/bot
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
+          BUFFER_CHANNEL_IDS: ${{ secrets.BUFFER_CHANNEL_IDS }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          PERSONA_AGENT_MODEL: claude-haiku-5-5
+          PERSONA_AGENT_EFFORT: low
+          PERSONA_AGENT_TAG_EVERY: "0" # token bots never @-tag other accounts
+          PERSONA_AGENT_TREND_EVERY: "6"
+          PERSONA_AGENT_SEARCHES: "1"
+          PERSONA_AGENT_IMAGES: card
+          PERSONA_AGENT_IMAGE_EVERY: "1"
+        run: |
+          pip install -q .
+          if [ -z "$ANTHROPIC_API_KEY" ]; then echo "::error::Add the ANTHROPIC_API_KEY secret."; exit 1; fi
+          targets=()
+          [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && targets+=(telegram)
+          [ -n "$BUFFER_API_KEY" ] && targets+=(buffer)
+          if [ ${#targets[@]} -eq 0 ]; then echo "::error::Add Telegram and/or Buffer secrets so the bot can post."; exit 1; fi
+          budget=$(sed -nE 's/^[[:space:]]+budget_usd:[[:space:]]*([0-9.]+).*/\1/p' bot/persona.yaml | head -1)
+          export PERSONA_AGENT_BUDGET_USD="${budget:-1.5}"
+          trending=$(grep -Eq '^[[:space:]]+trending:[[:space:]]*true' bot/persona.yaml && echo --trending || true)
+          persona-agent speak bot/persona.yaml --publish console "${targets[@]}" $trending
+
+      - name: Save bot memory
+        if: always() && steps.due.outputs.run == 'true'
+        working-directory: .state
+        run: |
+          git config user.name "token-voice bot"
+          git config user.email "token-voice-bot@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -q -m "memory: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q origin HEAD:bot-state
